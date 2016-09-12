@@ -325,6 +325,10 @@ public:
         emitFinished(SyncFileItem::NormalError);
     }
 
+    int runningNowAtRootJob() const {
+        return _rootJob->_runningNow;
+    }
+
     // timeout in seconds
     static int httpTimeout();
 
@@ -385,6 +389,7 @@ private:
     friend class PropagateRemoteMove;
     friend class PropagateUploadFileV1;
     friend class PropagateUploadFileNG;
+    friend class PropagateBundle;
 #endif
 };
 
