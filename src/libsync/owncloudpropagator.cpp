@@ -18,6 +18,7 @@
 #include "syncjournalfilerecord.h"
 #include "propagatedownload.h"
 #include "propagateupload.h"
+#include "propagatebundle.h"
 #include "propagateremotedelete.h"
 #include "propagateremotemove.h"
 #include "propagateremotemkdir.h"
@@ -71,6 +72,14 @@ qint64 freeSpaceLimit()
 OwncloudPropagator::~OwncloudPropagator()
 {}
 
+bool OwncloudPropagator::hasNetworkLimit()
+{
+    if (_downloadLimit.fetchAndAddAcquire(0) != 0 || _uploadLimit.fetchAndAddAcquire(0) != 0) {
+        return true;
+    }
+    return false;
+}
+
 /* The maximum number of active jobs in parallel  */
 int OwncloudPropagator::maximumActiveJob()
 {
@@ -79,7 +88,7 @@ int OwncloudPropagator::maximumActiveJob()
         max = 3; //default
     }
 
-    if (_downloadLimit.fetchAndAddAcquire(0) != 0 || _uploadLimit.fetchAndAddAcquire(0) != 0) {
+    if (hasNetworkLimit()) {
         // disable parallelism when there is a network limit.
         return 1;
     }
@@ -113,6 +122,61 @@ static bool blacklistCheck(SyncJournalDb* journal, const SyncFileItem& item)
     }
 
     return newEntry.isValid();
+}
+
+void PropagateItemJob::itemDone(SyncFileItemPtr item, SyncFileItem::Status status, const QString &errorString)
+{
+    if (item->_isRestoration) {
+        if( status == SyncFileItem::Success || status == SyncFileItem::Conflict) {
+            status = SyncFileItem::Restoration;
+        } else {
+            item->_errorString += tr("; Restoration Failed: %1").arg(errorString);
+        }
+    } else {
+        if( item->_errorString.isEmpty() ) {
+            item->_errorString = errorString;
+        }
+    }
+
+    if( _propagator->_abortRequested.fetchAndAddRelaxed(0) &&
+            (status == SyncFileItem::NormalError || status == SyncFileItem::FatalError)) {
+        // an abort request is ongoing. Change the status to Soft-Error
+        status = SyncFileItem::SoftError;
+    }
+
+    switch( status ) {
+    case SyncFileItem::SoftError:
+    case SyncFileItem::FatalError:
+        // do not blacklist in case of soft error or fatal error.
+        break;
+    case SyncFileItem::NormalError:
+        if (blacklistCheck(_propagator->_journal, *item) && item->_hasBlacklistEntry) {
+            // do not error if the item was, and continues to be, blacklisted
+            status = SyncFileItem::FileIgnored;
+            item->_errorString.prepend(tr("Continue blacklisting:") + " ");
+        }
+        break;
+    case SyncFileItem::Success:
+    case SyncFileItem::Restoration:
+        if( item->_hasBlacklistEntry ) {
+            // wipe blacklist entry.
+            _propagator->_journal->wipeErrorBlacklistEntry(item->_file);
+            // remove a blacklist entry in case the file was moved.
+            if( item->_originalFile != item->_file ) {
+                _propagator->_journal->wipeErrorBlacklistEntry(item->_originalFile);
+            }
+        }
+        break;
+    case SyncFileItem::Conflict:
+    case SyncFileItem::FileIgnored:
+    case SyncFileItem::NoStatus:
+        // nothing
+        break;
+    }
+
+    item->_status = status;
+
+    emit itemCompleted(*item, *this);
 }
 
 void PropagateItemJob::done(SyncFileItem::Status status, const QString &errorString)
@@ -311,11 +375,10 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
     QVector<PropagatorJob*> directoriesToRemove;
     QString removedDirectory;
 
-    PropagateBundle *bundledUploadRequestsJob = new PropagateBundle(this);
     quint64 chunkSize = OwncloudPropagator::chunkSize();
 
-    // TODO: here we should also check somehow if bundle is not broken for specific sync - bug recovery to standard PUTs
-    bool bundledRequestsEnabled = _account->bundledRequestsEnabled();
+    // TODO: here we should also check somehow if bundle is not blacklisted
+    bool enableBundledRequests = _account->bundledRequestsEnabled() && !this->hasNetworkLimit();
 
     foreach(const SyncFileItemPtr &item, items) {
 
@@ -393,12 +456,17 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
                 currentDirJob->append(dir);
             }
             directories.push(qMakePair(item->destination() + "/" , dir));
-        } else if (bundledRequestsEnabled
+        } else if (enableBundledRequests
                   && (item->_instruction == CSYNC_INSTRUCTION_NEW)
                   && (item->_direction == SyncFileItem::Up)
                   && (item->_size < chunkSize)) {
             //this will create list of bundle files to sync for that bundlejob
-            bundledUploadRequestsJob->append(item);
+            if (directories.top().second->_bundleJob.isNull()) {
+                PropagateBundle* bundleJob = new PropagateBundle(this);
+                directories.top().second->_bundleJob.reset(bundleJob);
+            }
+            PropagateBundle* bundleJob = dynamic_cast<PropagateBundle*>(directories.top().second->_bundleJob.data());
+            bundleJob->append(item);
         } else if (PropagateItemJob* current = createJob(item)) {
             if (item->_instruction == CSYNC_INSTRUCTION_TYPE_CHANGE) {
                 // will delete directories, so defer execution
@@ -412,21 +480,6 @@ void OwncloudPropagator::start(const SyncFileItemVector& items)
 
     foreach(PropagatorJob* it, directoriesToRemove) {
         _rootJob->append(it);
-    }
-
-    // Root job is DirectoryJob with FullParallelizm, so we need to halt bundle till all other jobs are finished.
-    // If there are no running jobs in root folder it means we can start with sending the bundle
-    // If there are running jobs, we halt and wait for finish of the other job to trigger sending
-    if (bundledRequestsEnabled && !bundledUploadRequestsJob->empty()) {
-        bundledUploadRequestsJob->_item->_direction = SyncFileItem::Direction::Up;
-        bundledUploadRequestsJob->_item->_type = SyncFileItem::Type::RequestsContainer;
-        bundledUploadRequestsJob->_item->_instruction = CSYNC_INSTRUCTION_NEW;
-        bundledUploadRequestsJob->_item->_size = bundledUploadRequestsJob->syncItemsSize();
-        bundledUploadRequestsJob->_item->_originalFile = tr("%1 file(s)").arg(bundledUploadRequestsJob->syncItemsNumber());
-        _rootJob->append(bundledUploadRequestsJob);
-    }
-    else{
-        delete bundledUploadRequestsJob;
     }
 
     connect(_rootJob.data(), SIGNAL(itemCompleted(const SyncFileItem &, const PropagatorJob &)),
@@ -626,6 +679,16 @@ bool PropagateDirectory::scheduleNextJob()
 
     if (_state == NotYetStarted) {
         _state = Running;
+
+        if(_bundleJob){
+            PropagateBundle* bundle = dynamic_cast<PropagateBundle*>(_bundleJob.take());
+            bundle->_item->_direction = SyncFileItem::Direction::Up;
+            bundle->_item->_type = SyncFileItem::Type::RequestsContainer;
+            bundle->_item->_instruction = CSYNC_INSTRUCTION_NEW;
+            bundle->_item->_size = bundle->syncItemsSize();
+            bundle->_item->_originalFile = tr("%1 file(s)").arg(bundle->syncItemsNumber());
+            _subJobs.append(bundle);
+        }
 
         if (!_firstJob && _subJobs.isEmpty()) {
             finalize();

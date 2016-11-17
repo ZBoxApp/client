@@ -90,7 +90,7 @@ void Account::setUser(const QString &user)
 QString Account::davFilesPath() const
 {
     //TODO DO NOT HARCODE PATH, GET IT FROM THE SERVER!!!!
-    QString dfp("remote.php/dav/files/");
+    QString dfp("/remote.php/dav/files/");
     dfp.append(_credentials->user());
     return dfp;
 }

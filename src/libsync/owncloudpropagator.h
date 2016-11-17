@@ -136,6 +136,7 @@ class PropagateItemJob : public PropagatorJob {
     Q_OBJECT
 protected:
     void done(SyncFileItem::Status status, const QString &errorString = QString());
+    void itemDone(SyncFileItemPtr item, SyncFileItem::Status status, const QString &errorString = QString());
 
     bool checkForProblemsWithShared(int httpStatusCode, const QString& msg);
 
@@ -187,6 +188,9 @@ public:
     // e.g: create the directory
     QScopedPointer<PropagateItemJob>_firstJob;
 
+    // bundling upload files job
+    QScopedPointer<PropagateItemJob> _bundleJob;
+
     // all the sub files or sub directories.
     QVector<PropagatorJob *> _subJobs;
 
@@ -199,7 +203,7 @@ public:
 
     explicit PropagateDirectory(OwncloudPropagator *propagator, const SyncFileItemPtr &item = SyncFileItemPtr(new SyncFileItem))
         : PropagatorJob(propagator)
-        , _firstJob(0), _item(item),  _jobsFinished(0), _runningNow(0), _hasError(SyncFileItem::NoStatus), _firstUnfinishedSubJob(0)
+        , _firstJob(0),_bundleJob(0), _item(item),  _jobsFinished(0), _runningNow(0), _hasError(SyncFileItem::NoStatus), _firstUnfinishedSubJob(0)
     { }
 
     virtual ~PropagateDirectory() {
@@ -215,6 +219,8 @@ public:
     virtual void abort() Q_DECL_OVERRIDE {
         if (_firstJob)
             _firstJob->abort();
+        if (_bundleJob)
+            _bundleJob->abort();
         foreach (PropagatorJob *j, _subJobs)
             j->abort();
     }
@@ -291,7 +297,7 @@ public:
     ~OwncloudPropagator();
 
     void start(const SyncFileItemVector &_syncedItems);
-
+    bool hasNetworkLimit();
     QAtomicInt _downloadLimit;
     QAtomicInt _uploadLimit;
     BandwidthManager _bandwidthManager;
